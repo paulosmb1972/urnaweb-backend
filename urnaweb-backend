@@ -1,11 +1,39 @@
+export default {
+  async fetch(req, env) {
+    const url = new URL(req.url);
+
+    if (url.pathname === "/login" && req.method === "POST")
+      return login(req, env);
+
+    if (url.pathname === "/confirm" && req.method === "GET")
+      return confirm(req, env);
+
+    if (url.pathname === "/can-start" && req.method === "POST")
+      return canStartElection(req, env);
+
+    if (url.pathname === "/coupon" && req.method === "POST")
+      return applyCoupon(req, env);
+
+    if (url.pathname === "/mp-webhook" && req.method === "POST")
+      return mpWebhook(req, env);
+
+    return new Response("Not found", { status: 404 });
+  }
+};
+
+/* ================= LOGIN ================= */
 async function login(req, env) {
   const { email } = await req.json();
+  if (!email || !email.endsWith("@gmail.com"))
+    return Response.json({ error: "Gmail obrigatório" }, { status: 400 });
+
   const token = crypto.randomUUID();
 
   await env.DB.prepare(`
     INSERT INTO users (email, token, elections_left)
     VALUES (?, ?, 1)
-    ON CONFLICT(email) DO UPDATE SET token = ?
+    ON CONFLICT(email)
+    DO UPDATE SET token = ?
   `).bind(email, token, token).run();
 
   await fetch("https://api.resend.com/emails", {
@@ -17,10 +45,12 @@ async function login(req, env) {
     body: JSON.stringify({
       from: "UrnaWeb <no-reply@urnaweb.app>",
       to: email,
-      subject: "Confirme seu acesso",
+      subject: "Confirme seu acesso ao UrnaWeb Pro",
       html: `
+        <h3>Confirmação de Login</h3>
+        <p>Clique no botão abaixo para acessar:</p>
         <a href="https://urnaweb.app/confirm.html?token=${token}">
-          Confirmar login
+          Confirmar acesso
         </a>
       `
     })
@@ -28,6 +58,8 @@ async function login(req, env) {
 
   return Response.json({ ok: true });
 }
+
+/* ================= CONFIRMAÇÃO ================= */
 async function confirm(req, env) {
   const token = new URL(req.url).searchParams.get("token");
 
@@ -35,20 +67,27 @@ async function confirm(req, env) {
     .prepare("SELECT * FROM users WHERE token = ?")
     .bind(token).first();
 
-  if (!user) return new Response("Token inválido", { status: 400 });
+  if (!user)
+    return new Response("Token inválido", { status: 400 });
 
-  await env.DB.prepare(
-    "UPDATE users SET verified = 1 WHERE token = ?"
-  ).bind(token).run();
+  await env.DB.prepare(`
+    UPDATE users SET verified = 1 WHERE token = ?
+  `).bind(token).run();
 
-  return Response.redirect("https://SEUSITE/app.html");
+  return Response.redirect("https://urnaweb.app/index.html");
 }
+
+/* ================= VERIFICAR ELEIÇÃO ================= */
 async function canStartElection(req, env) {
   const { email } = await req.json();
 
-  const user = await env.DB
-    .prepare("SELECT elections_left, discount FROM users WHERE email = ?")
-    .bind(email).first();
+  const user = await env.DB.prepare(`
+    SELECT elections_left, discount, verified
+    FROM users WHERE email = ?
+  `).bind(email).first();
+
+  if (!user || !user.verified)
+    return Response.json({ allowed: false, reason: "not_verified" });
 
   if (user.elections_left > 0)
     return Response.json({ allowed: true });
@@ -59,19 +98,22 @@ async function canStartElection(req, env) {
     discount: user.discount
   });
 }
+
+/* ================= CUPOM ================= */
 async function applyCoupon(req, env) {
   const { email, code } = await req.json();
 
-  const coupon = await env.DB
-    .prepare("SELECT * FROM coupons WHERE code = ?")
-    .bind(code).first();
+  const coupon = await env.DB.prepare(`
+    SELECT * FROM coupons WHERE code = ?
+  `).bind(code).first();
 
   if (!coupon)
     return Response.json({ error: "Cupom inválido" });
 
   if (coupon.type === "free") {
     await env.DB.prepare(`
-      UPDATE users SET elections_left = elections_left + ?
+      UPDATE users
+      SET elections_left = elections_left + ?
       WHERE email = ?
     `).bind(coupon.value, email).run();
   }
@@ -85,46 +127,20 @@ async function applyCoupon(req, env) {
 
   return Response.json({ success: true });
 }
+
+/* ================= MERCADO PAGO WEBHOOK ================= */
 async function mpWebhook(req, env) {
   const data = await req.json();
-  const email = data.payer?.email;
+  const email = data?.payer?.email;
+
   if (!email) return new Response("ok");
 
   await env.DB.prepare(`
     UPDATE users
-    SET elections_left = elections_left + 1, discount = 0
+    SET elections_left = elections_left + 1,
+        discount = 0
     WHERE email = ?
   `).bind(email).run();
 
   return new Response("ok");
 }
-async function mpWebhook(req, env) {
-  const data = await req.json();
-  const email = data.payer?.email;
-  if (!email) return new Response("ok");
-
-  await env.DB.prepare(`
-    UPDATE users
-    SET elections_left = elections_left + 1, discount = 0
-    WHERE email = ?
-  `).bind(email).run();
-
-  return new Response("ok");
-}
-CREATE TABLE users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  email TEXT UNIQUE,
-  verified INTEGER DEFAULT 0,
-  elections_left INTEGER DEFAULT 1,
-  discount INTEGER DEFAULT 0,
-  token TEXT
-);
-
-CREATE TABLE coupons (
-  code TEXT PRIMARY KEY,
-  type TEXT,
-  value INTEGER
-);
-
-INSERT INTO coupons VALUES ('50OFF', 'discount', 50);
-INSERT INTO coupons VALUES ('FREE5', 'free', 5);
