@@ -1,146 +1,54 @@
 export default {
-  async fetch(req, env) {
-    const url = new URL(req.url);
+  async fetch(request, env) {
+    // Cabeçalhos que liberam o acesso para qualquer origem (Resolve o erro de CORS)
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, admin",
+    };
 
-    if (url.pathname === "/login" && req.method === "POST")
-      return login(req, env);
+    // Responde a verificações prévias do navegador
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
 
-    if (url.pathname === "/confirm" && req.method === "GET")
-      return confirm(req, env);
+    const url = new URL(request.url);
 
-    if (url.pathname === "/can-start" && req.method === "POST")
-      return canStartElection(req, env);
+    // --- LÓGICA DO ADMINISTRADOR (LISTAR DADOS) ---
+    if (request.method === "GET" && url.searchParams.get("admin") === "secret123") {
+      try {
+        const list = await env.URNA_STORAGE.list();
+        const results = [];
+        for (const key of list.keys) {
+          const val = await env.URNA_STORAGE.get(key.name);
+          results.push({ id: key.name, content: JSON.parse(val) });
+        }
+        return new Response(JSON.stringify(results), { 
+          headers: { ...corsHeaders, "Content-Type": "application/json" } 
+        });
+      } catch (e) {
+        return new Response("Erro no KV: " + e.message, { status: 500, headers: corsHeaders });
+      }
+    }
 
-    if (url.pathname === "/coupon" && req.method === "POST")
-      return applyCoupon(req, env);
+    // --- LÓGICA DE SALVAMENTO (POST) ---
+    if (request.method === "POST") {
+      try {
+        const body = await request.json();
+        const type = body.type || "voto";
+        const id = `${type}_${Date.now()}`;
+        
+        // Salva no KV (Aqui usa o nome que você configurou no Binding)
+        await env.URNA_STORAGE.put(id, JSON.stringify(body));
+        
+        return new Response(JSON.stringify({ status: "sucesso" }), { 
+          headers: { ...corsHeaders, "Content-Type": "application/json" } 
+        });
+      } catch (e) {
+        return new Response("Erro ao salvar: " + e.message, { status: 500, headers: corsHeaders });
+      }
+    }
 
-    if (url.pathname === "/mp-webhook" && req.method === "POST")
-      return mpWebhook(req, env);
-
-    return new Response("Not found", { status: 404 });
+    return new Response("UrnaWeb Ativo", { headers: corsHeaders });
   }
 };
-
-/* ================= LOGIN ================= */
-async function login(req, env) {
-  const { email } = await req.json();
-  if (!email || !email.endsWith("@gmail.com"))
-    return Response.json({ error: "Gmail obrigatório" }, { status: 400 });
-
-  const token = crypto.randomUUID();
-
-  await env.DB.prepare(`
-    INSERT INTO users (email, token, elections_left)
-    VALUES (?, ?, 1)
-    ON CONFLICT(email)
-    DO UPDATE SET token = ?
-  `).bind(email, token, token).run();
-
-  await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${env.RESEND_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      from: "UrnaWeb <no-reply@urnaweb.app>",
-      to: email,
-      subject: "Confirme seu acesso ao UrnaWeb Pro",
-      html: `
-        <h3>Confirmação de Login</h3>
-        <p>Clique no botão abaixo para acessar:</p>
-        <a href="https://urnaweb.app/confirm.html?token=${token}">
-          Confirmar acesso
-        </a>
-      `
-    })
-  });
-
-  return Response.json({ ok: true });
-}
-
-/* ================= CONFIRMAÇÃO ================= */
-async function confirm(req, env) {
-  const token = new URL(req.url).searchParams.get("token");
-
-  const user = await env.DB
-    .prepare("SELECT * FROM users WHERE token = ?")
-    .bind(token).first();
-
-  if (!user)
-    return new Response("Token inválido", { status: 400 });
-
-  await env.DB.prepare(`
-    UPDATE users SET verified = 1 WHERE token = ?
-  `).bind(token).run();
-
-  return Response.redirect("https://urnaweb.app/index.html");
-}
-
-/* ================= VERIFICAR ELEIÇÃO ================= */
-async function canStartElection(req, env) {
-  const { email } = await req.json();
-
-  const user = await env.DB.prepare(`
-    SELECT elections_left, discount, verified
-    FROM users WHERE email = ?
-  `).bind(email).first();
-
-  if (!user || !user.verified)
-    return Response.json({ allowed: false, reason: "not_verified" });
-
-  if (user.elections_left > 0)
-    return Response.json({ allowed: true });
-
-  return Response.json({
-    allowed: false,
-    payment_url: "https://mpago.la/1VakcdN",
-    discount: user.discount
-  });
-}
-
-/* ================= CUPOM ================= */
-async function applyCoupon(req, env) {
-  const { email, code } = await req.json();
-
-  const coupon = await env.DB.prepare(`
-    SELECT * FROM coupons WHERE code = ?
-  `).bind(code).first();
-
-  if (!coupon)
-    return Response.json({ error: "Cupom inválido" });
-
-  if (coupon.type === "free") {
-    await env.DB.prepare(`
-      UPDATE users
-      SET elections_left = elections_left + ?
-      WHERE email = ?
-    `).bind(coupon.value, email).run();
-  }
-
-  if (coupon.type === "discount") {
-    await env.DB.prepare(`
-      UPDATE users SET discount = ?
-      WHERE email = ?
-    `).bind(coupon.value, email).run();
-  }
-
-  return Response.json({ success: true });
-}
-
-/* ================= MERCADO PAGO WEBHOOK ================= */
-async function mpWebhook(req, env) {
-  const data = await req.json();
-  const email = data?.payer?.email;
-
-  if (!email) return new Response("ok");
-
-  await env.DB.prepare(`
-    UPDATE users
-    SET elections_left = elections_left + 1,
-        discount = 0
-    WHERE email = ?
-  `).bind(email).run();
-
-  return new Response("ok");
-}
